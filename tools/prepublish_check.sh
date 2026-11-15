@@ -14,7 +14,8 @@
 # Built-in checks (no personal data in this script):
 #   * files that should never be published: photos/video/audio, packet
 #     captures, logs, .env, dschat.conf, allowed_macs.txt, settings.txt,
-#     local/, net/logs/ (only ds/dschat/icon.png is allowed as an image)
+#     local/, net/logs/ (only ds/dschat/icon.png and docs/images/*.png are
+#     allowed as images; those are listed so you can check them by eye)
 #   * MAC addresses (except the placeholder 02:00:00:00:00:01), e-mail
 #     addresses (except example.com/.org), /home/<user> paths,
 #     key-shaped strings (sk-..., AIza..., Bearer ..., ghp_...), IPv4
@@ -58,6 +59,8 @@ BAD_FILE = re.compile(r"(\.(jpe?g|png|gif|bmp|webp|heic|mp4|mov|avi|webm|wav|mp3
                       r"pcap|pcapng|cap|log|bak)$)|(^|/)(\.env|dschat\.conf|allowed_macs\.txt|"
                       r"settings\.txt|CLAUDE\.md|HISTORY\.md)$|(^|/)(local|net/logs)/", re.I)
 ALLOWED_FILES = {"ds/dschat/icon.png"}
+ALLOWED_IMAGE_DIR = re.compile(r"^docs/images/[\w.-]+\.png$")
+images = []
 
 RULES = [
     ("MAC address", re.compile(r"\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b", re.I),
@@ -123,6 +126,9 @@ def scan_text(text, where, is_license=False):
 
 checked = 0
 for f in files():
+    if ALLOWED_IMAGE_DIR.match(f):
+        images.append(f)
+        continue
     if BAD_FILE.search(f) and f not in ALLOWED_FILES:
         problems.append(f"{f}: file type/name that must not be published")
         continue
@@ -151,6 +157,9 @@ if os.path.isdir(".git"):
 print(f"prepublish_check: {checked} text files checked in {root}"
       f"{', ' + str(len(private)) + ' private patterns' if private else ''}"
       f"{', ' + str(len(secret_values)) + ' secret values' if secret_values else ''}")
+if images:
+    print(f"  images to check BY EYE (no MACs, IPs, names, About screen, Nintendo logos): "
+          f"{', '.join(images)}")
 for p in problems:
     print("  FOUND", p)
 print("prepublish_check:", "FAILED" if problems else "OK, nothing found")

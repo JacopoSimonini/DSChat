@@ -1,5 +1,10 @@
 # DSChat
 
+<p align="center">
+  <img src="docs/images/chat.png" alt="DSChat: a short conversation on the top screen, the touch keyboard with a few letters typed on the bottom screen, status bar showing the ollama profile and Online">
+</p>
+<p align="center"><sub>Screenshot from the melonDS emulator: both DS screens, shown at 2x.</sub></p>
+
 Chat with an AI (Claude, Gemini, Qwen, OpenAI, a local Ollama model, ...) from
 a **Nintendo DS Lite**. The DS is the screen and keyboard, and its microphone:
 hold Y to dictate. A small relay on a Linux laptop holds the API keys, talks
@@ -210,6 +215,11 @@ off (asks first; No is preselected).
 
 ### Voice input (hold Y)
 
+<p align="center">
+  <img src="docs/images/voice.png" alt="Voice input in progress: the input box shows Speak and a level bar, with the elapsed time out of 20 s">
+</p>
+<p align="center"><sub>Emulator screenshot (melonDS): recording while Y is held.</sub></p>
+
 1. Hold **Y** in the chat screen. The input box turns into a level bar:
    "Wait..." for 0.3 s while the microphone powers up, then **"Speak"**.
 2. Speak (up to 20 s; the bar shows your level, red means too loud). Your
@@ -229,6 +239,11 @@ the error appears in red and your message goes back into the input box. Lost
 connections (relay restart, Wi-Fi drop, closed lid) are retried by themselves.
 
 ### Settings screen and `settings.txt`
+
+<p align="center">
+  <img src="docs/images/settings.png" alt="The settings screen: network, security, IP, relay, port and voice language, with Test, Save and Cancel buttons">
+</p>
+<p align="center"><sub>Emulator screenshot (melonDS): the settings screen.</sub></p>
 
 At start-up, with a valid settings file, the app waits 3 s ("hold SELECT for
 settings") and connects. With no file or a broken one, the settings open by
