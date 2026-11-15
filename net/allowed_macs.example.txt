@@ -1,0 +1,9 @@
+# DSChat AP MAC allowlist (optional).
+# Copy this file to net/allowed_macs.txt (gitignored) and list your DS:
+#     cp net/allowed_macs.example.txt net/allowed_macs.txt
+# One MAC per line (six hex pairs separated by colons), # starts a comment.
+# Missing file or no MACs = every station may join.
+# Your DS shows its MAC under menu > About; ./dschat logs prints the MAC of
+# every device that joins.
+#
+# 02:00:00:00:00:01   # example only (a locally administered placeholder)

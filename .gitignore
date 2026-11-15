@@ -1,0 +1,34 @@
+# secrets and personal settings (never commit these)
+.env
+relay/.env
+net/dschat.conf
+net/allowed_macs.txt
+
+# personal files: photos, recordings, notes
+local/
+
+# runtime logs and packet captures
+net/logs/
+*.pcap
+*.pcapng
+*.log
+
+# recordings made by the mictest receiver
+*.wav
+
+# Python
+relay/.venv/
+relay/voice/.venv/
+relay/voice/models/
+__pycache__/
+*.pyc
+
+# DS build output
+ds/**/build/
+*.nds
+*.elf
+*.sav
+
+# tools
+tools/mic/build/
+tools/melontest/*.bak

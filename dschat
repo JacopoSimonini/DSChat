@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# DSChat laptop side in one command.
+#
+#   ./dschat start           AP + relay + hotspot watcher (asks for your sudo password)
+#   ./dschat stop            stop everything and restore the system (like net/ap-down.sh)
+#   ./dschat restart         stop + start
+#   ./dschat restart-relay   restart only the relay (the DS reconnects by itself)
+#   ./dschat status          AP, hotspot, relay, connected DS, last error (no sudo)
+#   ./dschat logs            follow relay + AP events (no sudo; Ctrl-C stops watching)
+#
+# The security mode comes from net/dschat.conf (gitignored, chmod 600; template:
+# net/dschat.conf.example): SECURITY=open or SECURITY=wep + WEP_KEY=...
+#
+# How it survives the terminal / desktop session ending: everything runs in
+# TRANSIENT systemd units, outside your login session:
+#   dschat-ap.scope        hostapd + dnsmasq (started by net/ap-up.sh)
+#   dschat-relay.service   relay/relay.py, as YOUR user (never root), sandboxed
+#   dschat-watch.service   checks every 5 s that the AP still matches the hotspot
+# Transient units live in /run: nothing is enabled at boot, nothing survives a
+# reboot. Runtime files: /run/dschat (AP, see ap-up.sh) and /run/dschat-ctl
+# (relay.log, watch.log, last error). `stop` saves the logs to net/logs/last/.
+#
+# net/ap-up.sh and net/ap-down.sh still work on their own (also --wep); do not
+# mix them with ./dschat while it is running.
+
+set -euo pipefail
+
+REPO=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+NET=$REPO/net
+CONF=$NET/dschat.conf
+CTL=/run/dschat-ctl
+STATE=/run/dschat
+UNIT_AP=dschat-ap.scope
+UNIT_RELAY=dschat-relay.service
+UNIT_WATCH=dschat-watch.service
+POLL=5                  # watcher period (s)
+HOTSPOT_GRACE=45        # s without the hotspot before the AP steps aside
+
+die()  { echo "dschat: ERROR: $*" >&2; exit 1; }
+info() { echo "dschat: $*"; }
+
+# shellcheck source=net/ap.conf
+source "$NET/ap.conf"
+# shellcheck source=net/iface.sh
+source "$NET/iface.sh"
+# the AP's own record wins while it is up (the default route may change)
+if [[ -r $STATE/info ]]; then
+    v=$(sed -n 's/^WIFI_IFACE=//p' "$STATE/info"); [[ -n $v ]] && WIFI_IFACE=$v
+    v=$(sed -n 's/^UPSTREAM_IFACE=//p' "$STATE/info"); [[ -n $v ]] && UPSTREAM_IFACE=$v
+    unset v
+fi
+# (when sourced by tools/test_dschat.sh a machine without Wi-Fi is fine)
+if ! dschat_resolve_ifaces && [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    die "cannot choose the Wi-Fi interface (see above)"
+fi
+
+# KEY=value reader: the file is never executed (it is user-editable and read
+# by root). Last KEY= line wins; value trimmed; may be wrapped in quotes.
+conf_value() {   # file key
+    local line val=""
+    while IFS= read -r line || [[ -n $line ]]; do
+        [[ $line =~ ^[[:space:]]*# ]] && continue
+        if [[ $line =~ ^[[:space:]]*$2[[:space:]]*=(.*)$ ]]; then
+            val=${BASH_REMATCH[1]}
+            val=${val#"${val%%[![:space:]]*}"}; val=${val%"${val##*[![:space:]]}"}
+            if [[ $val =~ ^\"(.*)\"$ || $val =~ ^\'(.*)\'$ ]]; then val=${BASH_REMATCH[1]}; fi
+        fi
+    done < "$1"
+    printf '%s' "$val"
+}
+
+need_root() {   # re-run through sudo, remembering who you are
+    if (( EUID != 0 )); then
+        exec sudo -- "$REPO/dschat" "$@"
+    fi
+    [[ -n ${SUDO_USER:-} && ${SUDO_USER} != root ]] \
+        || die "run it as your normal user (./dschat $1): the relay must not run as root"
+}
+
+unit_active() { systemctl is-active --quiet "$1"; }
+
+# Wi-Fi channel + frequency of the hotspot link ("" if not connected)
+hotspot_channel() {
+    iw dev "$WIFI_IFACE" info 2>/dev/null |
+        awk '/channel/ {gsub(/[(]/, "", $3); print $2, $3; exit}'
+}
+
+concurrent() { [[ $UPSTREAM_IFACE == "$WIFI_IFACE" ]]; }
+
+info_value() {  # KEY from /run/dschat/info (written by ap-up.sh)
+    if [[ -r $STATE/info ]]; then conf_value "$STATE/info" "$1"; fi
+}
+
+# hostapd alive? (/proc, not kill -0: that fails on root's processes for a user)
+hostapd_alive() {
+    local pid
+    pid=$(cat "$STATE/hostapd.pid" 2>/dev/null) || return 1
+    [[ -n $pid && $(cat "/proc/$pid/comm" 2>/dev/null) == hostapd ]]
+}
+
+note() {        # watcher/start: remember the last problem for `status`
+    printf '%s %s\n' "$(date '+%F %T')" "$*" > "$CTL/last_error"
+    echo "$(date '+%F %T') $*"
+}
+
+voice_status() {  # "voice: on (small, en/it)" / "voice: off (reason)" from the running relay
+    local v=""
+    [[ -r $CTL/relay.log ]] && v=$(grep -o 'INFO voice: .*' "$CTL/relay.log" | tail -1 | cut -d' ' -f2-)
+    printf '%-11s %s' "voice" "${v#voice: }"
+    [[ -n $v ]] || printf 'unknown (no relay log)'
+}
+
+relay_ping() {  # PING the relay over TCP (bash /dev/tcp): 0 if it answers PONG
+    # (in a child bash under `timeout`: a connect to an address that is not
+    # local any more could otherwise hang for minutes)
+    # shellcheck disable=SC2016
+    timeout 4 bash -c 'exec 3<>"/dev/tcp/$0/$1" && printf "PING 0000\n" >&3 &&
+                       read -r -t 3 -n 4 r <&3 && [[ $r == PONG ]]' \
+        "$AP_ADDR" "$RELAY_PORT" 2>/dev/null
+}
+
+# --------------------------------------------------------------------------
+# Security config (net/dschat.conf)
+# --------------------------------------------------------------------------
+
+load_security() {   # sets SECURITY, RELAY_DEBUG; checks the file
+    if [[ ! -e $CONF ]]; then
+        die "$CONF not found. Create it from the template:
+       cp net/dschat.conf.example net/dschat.conf && chmod 600 net/dschat.conf
+       then choose SECURITY=open or SECURITY=wep with WEP_KEY=..."
+    fi
+    local owner mode
+    owner=$(stat -c %U "$CONF"); mode=$(stat -c %a "$CONF")
+    [[ $owner == "$SUDO_USER" ]] || die "$CONF must belong to $SUDO_USER (it is $owner's)"
+    (( (8#$mode & 8#077) == 0 )) || die "$CONF is readable by other users (mode $mode): chmod 600 net/dschat.conf"
+    SECURITY=$(conf_value "$CONF" SECURITY); SECURITY=${SECURITY,,}
+    RELAY_DEBUG=$(conf_value "$CONF" RELAY_DEBUG); RELAY_DEBUG=${RELAY_DEBUG,,}
+    case $SECURITY in
+        open) ;;
+        wep)
+            local key
+            key=$(conf_value "$CONF" WEP_KEY)
+            [[ -n $key ]] || die "SECURITY=wep but WEP_KEY is empty in net/dschat.conf.
+       Put your key there: 5 or 13 characters, or 10 or 26 hex digits."
+            WEP_LEN=${#key}
+            ;;
+        *) die "SECURITY in net/dschat.conf must be open or wep (it is '$SECURITY')" ;;
+    esac
+}
+
+ap_args() {
+    AP_ARGS=(--no-watch)
+    [[ $SECURITY == wep ]] && AP_ARGS+=(--wep-file "$CONF")
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# AP / relay / watcher units
+# --------------------------------------------------------------------------
+
+check_hotspot() {
+    concurrent || return 0
+    local ch freq
+    read -r ch freq < <(hotspot_channel) || true
+    if [[ -z ${freq:-} ]]; then
+        die "$WIFI_IFACE is not connected. Turn on the phone hotspot (2.4 GHz) and
+       let the laptop join it, then run ./dschat start again."
+    fi
+    if (( freq > 2500 )); then
+        die "the hotspot is on 5 GHz (channel $ch, $freq MHz).
+       The DS Lite only does 2.4 GHz and the AP must share the hotspot's channel:
+       set the phone hotspot to 2.4 GHz, wait for the laptop to reconnect, retry."
+    fi
+}
+
+start_ap() {    # (quiet) - inside its own scope, so it outlives this session
+    ap_args
+    systemctl stop "$UNIT_AP" 2>/dev/null || true
+    if [[ ${1:-} == quiet ]]; then
+        systemd-run --quiet --scope --unit="$UNIT_AP" --slice=system.slice \
+            --description="DSChat access point (hostapd + dnsmasq)" \
+            -- "$NET/ap-up.sh" "${AP_ARGS[@]}" > "$CTL/ap-up.out" 2>&1
+    else
+        systemd-run --quiet --scope --unit="$UNIT_AP" --slice=system.slice \
+            --description="DSChat access point (hostapd + dnsmasq)" \
+            -- "$NET/ap-up.sh" "${AP_ARGS[@]}"
+    fi
+}
+
+stop_ap() {
+    systemctl stop "$UNIT_AP" 2>/dev/null || true
+    SUDO_UID=${SUDO_UID:-} "$NET/ap-down.sh" --quiet || true
+}
+
+start_relay() {
+    local args=()
+    [[ ${RELAY_DEBUG:-no} == yes ]] && args+=(--debug)
+    # yours, 0640: readable by you (./dschat logs), not by other users
+    [[ -e $CTL/relay.log ]] || install -o "$SUDO_USER" -g "$(id -gn "$SUDO_USER")" -m 0640 /dev/null "$CTL/relay.log"
+    systemctl reset-failed "$UNIT_RELAY" 2>/dev/null || true
+    systemd-run --quiet --unit="$UNIT_RELAY" \
+        --description="DSChat relay (AI provider bridge for the DS)" \
+        --uid="$SUDO_USER" --gid="$(id -gn "$SUDO_USER")" \
+        --working-directory="$REPO" \
+        --setenv=PYTHONUNBUFFERED=1 --setenv=PYTHONDONTWRITEBYTECODE=1 \
+        -p StandardOutput="append:$CTL/relay.log" -p StandardError="append:$CTL/relay.log" \
+        -p Restart=on-failure -p RestartSec=3 \
+        -p NoNewPrivileges=yes -p ProtectSystem=strict -p ProtectHome=read-only \
+        -p PrivateTmp=yes -p PrivateDevices=yes -p ProtectKernelTunables=yes \
+        -p ProtectKernelModules=yes -p ProtectControlGroups=yes -p RestrictSUIDSGID=yes \
+        -p "RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK" -p UMask=0077 \
+        -- "$REPO/relay/.venv/bin/python" "$REPO/relay/relay.py" "${args[@]}"
+}
+
+wait_relay() {  # up to 30 s for the relay to answer a PING (it loads the voice model first)
+    for _ in $(seq 60); do
+        relay_ping 2>/dev/null && return 0
+        unit_active "$UNIT_RELAY" || break
+        sleep 0.5
+    done
+    return 1
+}
+
+do_stop() {     # (quiet)
+    local q=${1:-}
+    systemctl stop "$UNIT_WATCH" 2>/dev/null || true
+    systemctl stop "$UNIT_RELAY" 2>/dev/null || true
+    stop_ap
+    if [[ -d $CTL ]]; then
+        local logs=$NET/logs/last
+        mkdir -p "$logs"
+        for f in relay.log watch.log; do
+            [[ -f $CTL/$f ]] && install -m 0600 "$CTL/$f" "$logs/$f"
+        done
+        [[ -n ${SUDO_UID:-} ]] && chown -R "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$NET/logs"
+        rm -rf "$CTL"
+    fi
+    systemctl reset-failed "$UNIT_RELAY" "$UNIT_WATCH" 2>/dev/null || true
+    [[ $q == quiet ]] || info "stopped: AP, relay and watcher; system restored (logs in net/logs/last/)"
+}
+
+cmd_start() {
+    need_root start
+    load_security
+    if unit_active "$UNIT_RELAY" || unit_active "$UNIT_WATCH" || unit_active "$UNIT_AP"; then
+        die "already running (./dschat status; ./dschat restart to restart)"
+    fi
+    [[ -e $STATE/up ]] && die "the AP is already up, probably from net/ap-up.sh: sudo net/ap-down.sh first"
+    [[ -x $REPO/relay/.venv/bin/python ]] || die "relay venv missing: see README (python3 -m venv relay/.venv ...)"
+    check_hotspot
+
+    # relay profiles: is the default usable? (runs as you: reads relay/.env)
+    local profiles rc=0
+    profiles=$(runuser -u "$SUDO_USER" -- "$REPO/relay/.venv/bin/python" -B "$REPO/relay/relay.py" \
+               --check-config 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        echo "$profiles" >&2
+        die "the relay's default profile has no API key (relay/.env ACTIVE_PROFILE / keys)"
+    fi
+
+    mkdir -p "$CTL"; chmod 755 "$CTL"
+    printf '%s\n' "$SECURITY" > "$CTL/security"
+    : > "$CTL/last_error"
+    trap 'echo "dschat: start failed, cleaning up" >&2; do_stop quiet' ERR
+
+    info "starting the access point ($SECURITY)..."
+    start_ap
+    info "starting the relay..."
+    start_relay
+    if ! wait_relay; then
+        tail -n 15 "$CTL/relay.log" >&2 || true
+        false
+    fi
+    systemd-run --quiet --unit="$UNIT_WATCH" --description="DSChat hotspot/AP watcher" \
+        --setenv=SUDO_USER="$SUDO_USER" --setenv=SUDO_UID="$SUDO_UID" \
+        --setenv=SUDO_GID="${SUDO_GID:-$SUDO_UID}" \
+        -p StandardOutput="append:$CTL/watch.log" -p StandardError="append:$CTL/watch.log" \
+        -- "$REPO/dschat" _watch
+    trap - ERR
+
+    local ch
+    ch=$(info_value CHANNEL)
+    echo
+    info "DSChat is running"
+    echo "    Wi-Fi       SSID $AP_SSID, channel $ch, $( [[ $SECURITY == wep ]] \
+            && echo "WEP (${WEP_LEN}-character key from net/dschat.conf; the DS needs the same key)" \
+            || echo "open (no password)")"
+    echo "    relay       $AP_ADDR:$RELAY_PORT$( [[ ${RELAY_DEBUG:-no} == yes ]] && echo '  [debug: messages are logged]')"
+    echo "    $(voice_status)"
+    echo "    profiles    (* = default)"
+    echo "$profiles" | grep -v '^voice:' | sed -e 's/^/                /' -e 's/   <- default/   */'
+    echo
+    echo "    ./dschat status | logs | stop      (closing this terminal is fine)"
+}
+
+cmd_stop() {
+    need_root stop
+    do_stop
+}
+
+cmd_restart_relay() {
+    need_root restart-relay
+    unit_active "$UNIT_RELAY" || die "the relay is not running (./dschat start)"
+    systemctl restart "$UNIT_RELAY"
+    if wait_relay; then info "relay restarted (conversation history cleared)"
+    else die "relay did not come back: ./dschat logs"; fi
+}
+
+# --------------------------------------------------------------------------
+# Watcher (dschat-watch.service, root): keeps the AP on the hotspot's channel
+# --------------------------------------------------------------------------
+
+cmd_watch() {
+    load_security
+    local away_since=0 waiting="" last_msg=""
+    say_once() { [[ $1 == "$last_msg" ]] || { note "$1"; last_msg=$1; }; }
+    echo "$(date '+%F %T') watcher started (every ${POLL}s)"
+    while sleep "$POLL"; do
+        local ch="" freq="" ap_ch hostapd_ok=0
+        if concurrent; then read -r ch freq < <(hotspot_channel) || true; fi
+        ap_ch=$(info_value CHANNEL)
+        hostapd_alive && hostapd_ok=1
+
+        if [[ -n $waiting ]]; then
+            # AP stepped aside; bring it back once the hotspot is on 2.4 GHz
+            if ! concurrent || { [[ -n $freq ]] && (( freq < 2500 )); }; then
+                note "hotspot back on channel ${ch:-?}: starting the AP again"
+                if start_ap quiet; then
+                    waiting=""; last_msg=""
+                    wait_relay || { note "relay did not answer after the AP restart: restarting it"
+                                    systemctl restart "$UNIT_RELAY"; }
+                else
+                    say_once "AP restart failed: $(tail -n 3 "$CTL/ap-up.out" | tr '\n' ' ')"
+                fi
+            fi
+            continue
+        fi
+
+        if [[ ! -e $STATE/up ]]; then
+            say_once "AP is down and was not stopped by ./dschat (net/ap-down.sh?): ./dschat restart"
+            continue
+        fi
+        if (( ! hostapd_ok )); then
+            note "hostapd stopped unexpectedly: restarting the AP"
+            stop_ap; waiting=restart
+            continue
+        fi
+        concurrent || continue
+
+        if [[ -z $freq ]]; then             # hotspot link down
+            (( away_since )) || away_since=$(date +%s)
+            if (( $(date +%s) - away_since >= HOTSPOT_GRACE )); then
+                note "no hotspot for ${HOTSPOT_GRACE}s: AP stopped so $WIFI_IFACE can rejoin the hotspot on any channel; it comes back by itself"
+                stop_ap; waiting=hotspot; away_since=0
+            fi
+            continue
+        fi
+        away_since=0
+        if (( freq > 2500 )); then
+            note "the hotspot moved to 5 GHz (channel $ch): AP stopped; set the hotspot to 2.4 GHz and it comes back by itself"
+            stop_ap; waiting=5ghz
+            continue
+        fi
+        if [[ -n $ap_ch && $ch != "$ap_ch" ]]; then
+            note "the hotspot moved from channel $ap_ch to $ch: restarting the AP on channel $ch"
+            stop_ap; waiting=channel
+            continue
+        fi
+    done
+}
+
+# --------------------------------------------------------------------------
+# status / logs (no root needed)
+# --------------------------------------------------------------------------
+
+cmd_status() {
+    local ok=1
+    echo "DSChat status"
+    # AP
+    if [[ -e $STATE/up ]]; then
+        local sec ch hp="hostapd NOT running"
+        sec=$(info_value SECURITY); ch=$(info_value CHANNEL)
+        if [[ -z $sec && -r $STATE/hostapd.conf ]]; then    # AP from an older ap-up.sh
+            sec=open; grep -q '^wep_key' "$STATE/hostapd.conf" && sec=wep
+            ch=$(sed -n 's/^channel=//p' "$STATE/hostapd.conf")
+        fi
+        if hostapd_alive; then hp="up"; else ok=0; fi
+        printf '  %-9s %s: SSID %s, %s, channel %s, %s\n' "AP" "$hp" "$AP_SSID" "${sec:-?}" "${ch:-?}" "$AP_IFACE"
+    else
+        printf '  %-9s %s\n' "AP" "down"; ok=0
+    fi
+    # hotspot
+    if concurrent; then
+        local hch hfreq
+        read -r hch hfreq < <(hotspot_channel) || true
+        if [[ -z ${hfreq:-} ]]; then
+            printf '  %-9s %s\n' "hotspot" "$WIFI_IFACE NOT connected"; ok=0
+        else
+            local band="2.4 GHz"; (( hfreq > 2500 )) && band="5 GHz - the DS needs 2.4 GHz!"
+            local warn=""
+            [[ -e $STATE/up && -n $(info_value CHANNEL) && $hch != "$(info_value CHANNEL)" ]] \
+                && warn="  <- differs from the AP's channel"
+            printf '  %-9s %s on channel %s (%s)%s\n' "hotspot" "$WIFI_IFACE" "$hch" "$band" "$warn"
+        fi
+    else
+        printf '  %-9s %s (AP on its own channel %s)\n' "upstream" "$UPSTREAM_IFACE" "$AP_CHANNEL"
+    fi
+    # relay
+    if unit_active "$UNIT_RELAY"; then
+        local prof="" pong="no answer"
+        relay_ping 2>/dev/null && pong="answers PING"
+        [[ -r $CTL/relay.log ]] && prof=$(grep -o 'default profile=[a-z0-9_-]*' "$CTL/relay.log" | tail -1 | cut -d= -f2)
+        printf '  %-9s running on %s:%s (%s), default profile %s\n' "relay" "$AP_ADDR" "$RELAY_PORT" "$pong" "${prof:-?}"
+        printf '  %s\n' "$(voice_status)"
+    elif relay_ping 2>/dev/null; then
+        printf '  %-9s running outside ./dschat (answers on %s:%s)\n' "relay" "$AP_ADDR" "$RELAY_PORT"
+    else
+        printf '  %-9s %s\n' "relay" "not running"; ok=0
+    fi
+    # watcher
+    if unit_active "$UNIT_WATCH"; then printf '  %-9s %s\n' "watcher" "running"
+    elif [[ -d $CTL ]]; then printf '  %-9s %s\n' "watcher" "NOT running"; ok=0; fi
+    # stations
+    if [[ -e $STATE/up ]]; then
+        local dump n=0
+        dump=$(iw dev "$AP_IFACE" station dump 2>/dev/null || true)
+        while read -r mac; do
+            [[ -z $mac ]] && continue
+            n=$((n + 1))
+            local ip sig secs conn="not connected to the relay"
+            ip=$(awk -v m="$mac" 'tolower($2) == m {print $3}' "$STATE/dnsmasq.leases" 2>/dev/null | tail -1)
+            sig=$(awk -v m="$mac" '$1 == "Station" {cur = ($2 == m)} cur && /signal:/ {print $2; exit}' <<<"$dump")
+            secs=$(awk -v m="$mac" '$1 == "Station" {cur = ($2 == m)} cur && /connected time:/ {print $3; exit}' <<<"$dump")
+            [[ -n $ip ]] && ss -Htn state established "( sport = :$RELAY_PORT )" 2>/dev/null \
+                | grep -q " $ip:" && conn="connected to the relay"
+            printf '  %-9s %s  IP %s  signal %s dBm  joined %ss ago, %s\n' "DS" "$mac" "${ip:-?}" "${sig:-?}" "${secs:-?}" "$conn"
+        done < <(awk '$1 == "Station" {print $2}' <<<"$dump")
+        (( n )) || printf '  %-9s %s\n' "DS" "none connected"
+    fi
+    # last problem
+    local err=""
+    [[ -s $CTL/last_error ]] && err=$(cat "$CTL/last_error")
+    local rerr=""
+    [[ -r $CTL/relay.log ]] && rerr=$(grep -E ' (WARNING|ERROR) ' "$CTL/relay.log" | tail -1 || true)
+    [[ -n $err ]] && printf '  %-9s %s\n' "last" "$err"
+    [[ -n $rerr ]] && printf '  %-9s %s\n' "relay err" "$rerr"
+    [[ -z $err && -z $rerr ]] && printf '  %-9s %s\n' "last" "no errors"
+    (( ok )) && return 0 || return 3
+}
+
+cmd_logs() {
+    local files=()
+    for f in "$CTL/relay.log" "$CTL/watch.log"; do [[ -r $f ]] && files+=("$f"); done
+    (( ${#files[@]} )) || die "not running (no logs in $CTL); old logs: net/logs/last/"
+    trap 'kill 0 2>/dev/null' EXIT INT TERM
+    [[ -e $STATE/hostapd.log ]] && "$NET/ap-watch.sh" &
+    tail -n 20 -F "${files[@]}"
+}
+
+# (sourcing this file only defines the functions: tools/test_dschat.sh)
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
+case ${1:-} in
+    start)          cmd_start ;;
+    stop)           cmd_stop ;;
+    restart)        need_root restart; do_stop quiet; cmd_start ;;
+    restart-relay)  cmd_restart_relay ;;
+    status)         cmd_status ;;
+    logs)           cmd_logs ;;
+    _watch)         (( EUID == 0 )) || die "_watch is internal (dschat-watch.service)"
+                    cmd_watch ;;
+    -h|--help|help|"") sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (start | stop | restart | restart-relay | status | logs)" ;;
+esac

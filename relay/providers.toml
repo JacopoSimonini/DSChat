@@ -1,0 +1,117 @@
+# DSChat relay: AI provider profiles (committed; NO secrets here).
+#
+# [profiles.<name>]   name: 1-16 chars [a-z0-9_-], shown on the DS
+#   adapter           "anthropic" (native SDK) | "openai" (any OpenAI-compatible
+#                     Chat Completions endpoint)
+#   model             model ID
+#   label             free text, optional
+#   base_url          required for "openai"; optional for "anthropic"
+#   api_key_env       NAME of the env var in relay/.env holding the key.
+#                     Omit for keyless local servers (Ollama).
+#   max_tokens        optional, overrides MAX_TOKENS from .env (reasoning included)
+#   max_tokens_param  openai only: "max_tokens" (default) | "max_completion_tokens"
+#   system_role       openai only: "system" (default) | "developer"
+#   [profiles.<name>.params]   extra fields merged into the request body
+#                     (provider-specific options: reasoning effort, thinking...)
+#
+# ACTIVE_PROFILE in relay/.env selects the default profile.
+# Model IDs and base URLs below were taken from each provider's docs on
+# 2026-11-12; check them again if a profile starts failing (tools/client.py --check).
+
+# --- Anthropic (native SDK) ---------------------------------------------------
+[profiles.claude]
+adapter = "anthropic"
+label = "Claude Haiku 5.5"
+model = "claude-haiku-5-5"
+api_key_env = "ANTHROPIC_API_KEY"
+[profiles.claude.params]
+output_config = { effort = "low" }       # adaptive thinking stays on, kept short
+
+# --- Google Gemini (OpenAI-compatible endpoint) -----------------------------------
+# Docs: ai.google.dev/gemini-api/docs/openai. Thinking cannot be disabled on
+# Gemini 3+; "minimal" is the lowest level. Measured 2026-11-12 (16 requests,
+# 4 prompts): median time to first text 5.82 s minimal vs 5.87 s low - no real
+# difference (Gemini's wait is not thinking), answers equally good.
+# Thoughts are not returned unless requested.
+[profiles.gemini]
+adapter = "openai"
+label = "Gemini 3.5 Flash-Lite"
+base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+model = "gemini-3.5-flash-lite"
+api_key_env = "GEMINI_API_KEY"
+[profiles.gemini.params]
+reasoning_effort = "minimal"
+
+# --- Qwen, Alibaba Cloud Model Studio (OpenAI-compatible mode) --------------------
+# API keys are bound to the region where they were created: base_url MUST match.
+#   Singapore (international):  https://dashscope-intl.aliyuncs.com/compatible-mode/v1   (legacy domain, still served)
+#                               https://<WorkspaceId>.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1
+#   US (Virginia):              https://<WorkspaceId>.us-east-1.maas.aliyuncs.com/compatible-mode/v1
+#   China (Beijing):            https://dashscope.aliyuncs.com/compatible-mode/v1   (legacy domain)
+#                               https://<WorkspaceId>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+#   Hong Kong / Tokyo:          <WorkspaceId>.cn-hongkong / .ap-northeast-1 .maas.aliyuncs.com
+# qwen3.8-flash thinks by default; enable_thinking=false gives faster replies.
+[profiles.qwen]
+adapter = "openai"
+label = "Qwen 3.8 Flash (Singapore)"
+base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+model = "qwen3.8-flash"
+api_key_env = "DASHSCOPE_API_KEY"
+[profiles.qwen.params]
+enable_thinking = false
+
+# --- OpenAI ------------------------------------------------------------------------
+# gpt-6-luna: cheapest current model, a reasoning model (default effort medium);
+# "none" skips reasoning. Reasoning models take max_completion_tokens and the
+# developer role.
+[profiles.openai]
+adapter = "openai"
+label = "GPT-6 Luna"
+base_url = "https://api.openai.com/v1"
+model = "gpt-6-luna"
+api_key_env = "OPENAI_API_KEY"
+max_tokens_param = "max_completion_tokens"
+system_role = "developer"
+[profiles.openai.params]
+reasoning_effort = "none"
+
+# --- Ollama (local, no key) --------------------------------------------------------
+# Any model from `ollama list`. Thinking models' inline <think> blocks are
+# filtered out by the relay.
+[profiles.ollama]
+adapter = "openai"
+label = "Ollama gemma3:4b (local)"
+base_url = "http://localhost:11434/v1"
+model = "gemma3:4b"
+
+# --- More OpenAI-compatible providers (uncomment, set a model from their docs) ------
+# [profiles.mistral]
+# adapter = "openai"
+# base_url = "https://api.mistral.ai/v1"
+# model = "<model-id>"
+# api_key_env = "MISTRAL_API_KEY"
+# [profiles.mistral.params]
+# reasoning_effort = "none"          # thinking models stream typed chunks; relay keeps only text
+#
+# [profiles.deepseek]
+# adapter = "openai"
+# base_url = "https://api.deepseek.com"
+# model = "deepseek-flash"
+# api_key_env = "DEEPSEEK_API_KEY"
+#
+# [profiles.groq]
+# adapter = "openai"
+# base_url = "https://api.groq.com/openai/v1"
+# model = "<model-id>"
+# api_key_env = "GROQ_API_KEY"
+# max_tokens_param = "max_completion_tokens"
+# [profiles.groq.params]
+# reasoning_format = "hidden"        # reasoning models only; default "raw" = inline <think> (also filtered)
+#
+# [profiles.openrouter]
+# adapter = "openai"
+# base_url = "https://openrouter.ai/api/v1"
+# model = "<vendor/model-id>"
+# api_key_env = "OPENROUTER_API_KEY"
+# [profiles.openrouter.params]
+# reasoning = { exclude = true }     # don't send reasoning back at all

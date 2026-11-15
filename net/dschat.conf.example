@@ -1,0 +1,22 @@
+# DSChat laptop settings for ./dschat start.
+# Copy to net/dschat.conf (gitignored) and keep it private:
+#     cp net/dschat.conf.example net/dschat.conf && chmod 600 net/dschat.conf
+# ./dschat refuses to start if the file is readable by other users.
+# Plain KEY=value lines; the file is read, never executed.
+
+# Wi-Fi security of the DS's network: open or wep.
+#   open = no password (anyone in range can join; the MAC allowlist and the
+#          firewall still apply)
+#   wep  = WEP, the best the DS Lite supports (it cannot do WPA). WEP is weak
+#          and can be cracked, but it keeps casual users off.
+SECURITY=wep
+
+# WEP key: 5 or 13 characters (letters, digits, symbols except " and \), or
+# 10 or 26 hex digits. Use 13 characters. Type the same key on the DS
+# (Settings > Security: WEP > WEP key). Quotes are optional; write the key
+# right after = and put no comment on the same line.
+WEP_KEY=
+
+# yes = the relay also logs the text of your messages (for debugging).
+# Default no: the log has only sizes, timings and errors, never keys.
+RELAY_DEBUG=no
